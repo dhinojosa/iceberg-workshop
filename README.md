@@ -1,4 +1,4 @@
-# Event-Driven Architecture
+# Apache Iceberg Workshop
 
 [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://github.com/codespaces/new/dhinojosa/iceberg-workshop?hide_repo_select=true&ref=main&repo=748638957&machine=standardLinux32gb)
 

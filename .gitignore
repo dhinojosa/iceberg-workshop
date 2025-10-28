@@ -1,0 +1,11 @@
+notebooks/.ipynb_checkpoints
+*.html
+*.sw[op]
+node_modules/
+dist/
+*.zip
+.idea/
+projects/shared-lib/*
+/projects/flink-hadoop-docker/resources/*
+*-checkpoint.ipynb
+target

@@ -1,0 +1,282 @@
+services:
+    # ---------- Spark cluster ----------
+    spark:
+        image: dhinojosa/spark-iceberg:0.1.2
+        container_name: spark
+        command: /opt/spark/sbin/start-master.sh
+        environment:
+            - SPARK_NO_DAEMONIZE=true
+            - SPARK_PUBLIC_DNS=localhost
+            - SPARK_MASTER_WEBUI_PORT=8080
+        ports:
+            - "8080:8080"
+            - "7077:7077"
+        volumes:
+            - ./conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+            - ./conf/core-site.xml:/etc/hadoop/conf/core-site.xml
+        networks: [ mlnet ]
+
+    spark-worker:
+        image: dhinojosa/spark-iceberg:0.1.2
+        container_name: spark-worker
+        depends_on: [ spark ]
+        command: /opt/spark/sbin/start-worker.sh spark://spark:7077
+        environment:
+            - SPARK_WORKER_MEMORY=2g
+            - SPARK_WORKER_CORES=2
+            - SPARK_NO_DAEMONIZE=true
+            - SPARK_PUBLIC_DNS=localhost
+            - SPARK_WORKER_WEBUI_PORT=8081
+        ports:
+            - "8081:8081"
+        volumes:
+            - ./conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+            - ./conf/core-site.xml:/etc/hadoop/conf/core-site.xml
+        networks: [ mlnet ]
+
+    spark-history:
+        image: dhinojosa/spark-iceberg:0.1.2
+        container_name: spark-history
+        depends_on: [ minio, minio-setup ]
+        command: /opt/spark/sbin/start-history-server.sh
+        environment:
+            - SPARK_NO_DAEMONIZE=true
+            - SPARK_PUBLIC_DNS=localhost
+        ports:
+            - "18080:18080"
+        volumes:
+            - ./conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+            - ./conf/core-site.xml:/etc/hadoop/conf/core-site.xml
+        networks: [ mlnet ]
+
+    # ---------- MinIO (S3) ----------
+    minio:
+        image: quay.io/minio/minio:RELEASE.2025-07-23T15-54-02Z
+        container_name: minio
+        environment:
+            - MINIO_ROOT_USER=${MINIO_ACCESS_KEY}
+            - MINIO_ROOT_PASSWORD=${MINIO_SECRET_ACCESS_KEY}
+            - MINIO_STORAGE_USE_HTTPS=false
+        command: server /data --console-address ":9001"
+        ports:
+            - "9000:9000"   # S3 API
+            - "9001:9001"   # MinIO console
+        volumes:
+            - minio_data:/data
+        networks: [ mlnet ]
+        healthcheck:
+            test: [ "CMD", "curl", "-f", "http://localhost:9000/minio/health/ready" ]
+            interval: 2s
+            timeout: 2s
+            retries: 30
+            start_period: 10s
+
+    minio-setup:
+        image: quay.io/minio/mc:RELEASE.2025-07-21T05-28-08Z
+        depends_on:
+            minio:
+                condition: service_healthy
+        environment:
+            - MINIO_ROOT_USER=${MINIO_ACCESS_KEY}
+            - MINIO_ROOT_PASSWORD=${MINIO_SECRET_ACCESS_KEY}
+        entrypoint: >
+            /bin/sh -c "
+              sleep 5 &&
+              mc alias set local http://minio:9000 minioadmin minioadmin &&
+              mc mb -p local/warehouse || true &&
+              mc mb -p local/spark-events || true &&
+              mc mb -p local/spark-events/logs || true &&
+              mc policy set public local/warehouse &&
+              mc policy set public local/spark-events &&
+              echo 'MinIO buckets and prefixes ready.'
+            "
+        networks: [ mlnet ]
+
+    # ---------- Iceberg REST Catalog ----------
+    iceberg-rest:
+        image: tabulario/iceberg-rest:1.6.0
+        container_name: iceberg-rest
+        depends_on: [ minio, minio-setup ]
+        environment:
+            - CATALOG_WAREHOUSE=s3a://warehouse/
+            # - CATALOG_CATALOG__IMPL=org.apache.iceberg.rest.RESTCatalog
+            - CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO
+            - CATALOG_S3_ENDPOINT=http://minio:9000
+            - AWS_ACCESS_KEY_ID=${MINIO_ACCESS_KEY}
+            - AWS_SECRET_ACCESS_KEY=${MINIO_SECRET_ACCESS_KEY}
+            - AWS_REGION=us-east-1
+            - CATALOG_S3_PATH__STYLE__ACCESS=true
+        volumes:
+            - ./conf/core-site.xml:/etc/hadoop/conf/core-site.xml
+        ports:
+            - "8181:8181"
+        networks: [ mlnet ]
+
+    jupyter:
+        image: dhinojosa/pyspark-iceberg-notebook:0.1.1
+        container_name: jupyter
+        depends_on: [ spark, iceberg-rest ]
+        environment:
+            JUPYTER_ENABLE_LAB: "yes"
+            MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+            MINIO_SECRET_ACCESS_KEY: ${MINIO_SECRET_ACCESS_KEY}
+            AWS_REGION: us-east-1
+            # Convenient vars for the notebook
+            ICEBERG_ENDPOINT: http://iceberg-rest:8181
+            MINIO_ENDPOINT: http://minio:9000
+        ports:
+            - "8888:8888"
+        volumes:
+            - ./notebooks:/home/jovyan/work
+            - ./conf/spark-defaults.conf:/usr/local/spark/conf/spark-defaults.conf
+            - ./conf/core-site.xml:/etc/hadoop/conf/core-site.xml
+        command: >
+            start-notebook.sh --ServerApp.token='' --ServerApp.password=''
+        networks: [ mlnet ]
+    trino:
+        image: trinodb/trino:476
+        container_name: trino
+        depends_on: [ minio, iceberg-rest ]
+        ports:
+            - "8082:8080"   # Trino Web UI
+        environment:
+            AWS_ACCESS_KEY_ID: ${MINIO_ACCESS_KEY}
+            AWS_SECRET_ACCESS_KEY: ${MINIO_SECRET_ACCESS_KEY}
+        volumes:
+            - ./trino/catalog:/etc/trino/catalog
+        networks: [ mlnet ]
+
+    broker:
+        image: confluentinc/cp-kafka:7.6.1
+        hostname: broker
+        container_name: broker
+        ports:
+            - "9092:9092"
+            - "9101:9101"
+        environment:
+            KAFKA_NODE_ID: 1
+            KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
+            KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://broker:29092,PLAINTEXT_HOST://localhost:9092'
+            KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+            KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+            KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+            KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+            KAFKA_JMX_PORT: 9101
+            KAFKA_JMX_HOSTNAME: localhost
+            KAFKA_PROCESS_ROLES: 'broker,controller'
+            KAFKA_CONTROLLER_QUORUM_VOTERS: '1@broker:29093'
+            KAFKA_LISTENERS: 'PLAINTEXT://broker:29092,CONTROLLER://broker:29093,PLAINTEXT_HOST://0.0.0.0:9092'
+            KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
+            KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+            KAFKA_LOG_DIRS: '/tmp/kraft-combined-logs'
+            # Replace CLUSTER_ID with a unique base64 UUID using "bin/kafka-storage.sh random-uuid"
+            # See https://docs.confluent.io/kafka/operations-tools/kafka-tools.html#kafka-storage-sh
+            CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
+        networks: [ mlnet ]
+
+    schema-registry:
+        image: confluentinc/cp-schema-registry:7.6.1
+        hostname: schema-registry
+        container_name: schema-registry
+        depends_on:
+            - broker
+        ports:
+            - "8099:8081"
+        environment:
+            SCHEMA_REGISTRY_HOST_NAME: schema-registry
+            SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: 'broker:29092'
+            SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+        networks: [ mlnet ]
+
+    connect:
+        image: cnfldemos/cp-server-connect-datagen:0.6.4-7.6.0
+        hostname: connect
+        container_name: connect
+        depends_on:
+            - broker
+            - schema-registry
+        ports:
+            - "8083:8083"
+        environment:
+            CONNECT_BOOTSTRAP_SERVERS: 'broker:29092'
+            CONNECT_REST_ADVERTISED_HOST_NAME: connect
+            CONNECT_GROUP_ID: compose-connect-group
+            CONNECT_CONFIG_STORAGE_TOPIC: docker-connect-configs
+            CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: 1
+            CONNECT_OFFSET_FLUSH_INTERVAL_MS: 10000
+            CONNECT_OFFSET_STORAGE_TOPIC: docker-connect-offsets
+            CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: 1
+            CONNECT_STATUS_STORAGE_TOPIC: docker-connect-status
+            CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: 1
+            CONNECT_KEY_CONVERTER: org.apache.kafka.connect.storage.StringConverter
+            CONNECT_VALUE_CONVERTER: io.confluent.connect.avro.AvroConverter
+            CONNECT_VALUE_CONVERTER_SCHEMA_REGISTRY_URL: http://schema-registry:8081
+            # CLASSPATH required due to CC-2422
+            CLASSPATH: /usr/share/java/monitoring-interceptors/monitoring-interceptors-7.6.1.jar
+            CONNECT_PRODUCER_INTERCEPTOR_CLASSES: "io.confluent.monitoring.clients.interceptor.MonitoringProducerInterceptor"
+            CONNECT_CONSUMER_INTERCEPTOR_CLASSES: "io.confluent.monitoring.clients.interceptor.MonitoringConsumerInterceptor"
+            CONNECT_PLUGIN_PATH: "/usr/share/confluent-hub-components"
+            CONNECT_LOG4J_LOGGERS: org.apache.zookeeper=ERROR,org.I0Itec.zkclient=ERROR,org.reflections=ERROR
+            HADOOP_CONF_DIR: /etc/hadoop/conf
+            AWS_REGION: us-east-1
+            AWS_ACCESS_KEY_ID: "minioadmin"
+            AWS_SECRET_ACCESS_KEY: "minioadmin"
+        volumes:
+            - ./conf/core-site.xml:/etc/hadoop/conf/core-site.xml
+        networks: [ mlnet ]
+
+    control-center:
+        image: confluentinc/cp-enterprise-control-center:7.6.1
+        hostname: control-center
+        container_name: control-center
+        depends_on:
+            - broker
+            - schema-registry
+            - connect
+            - ksqldb-server
+        ports:
+            - "9021:9021"
+        environment:
+            CONTROL_CENTER_BOOTSTRAP_SERVERS: 'broker:29092'
+            CONTROL_CENTER_CONNECT_CONNECT-DEFAULT_CLUSTER: 'connect:8083'
+            CONTROL_CENTER_CONNECT_HEALTHCHECK_ENDPOINT: '/connectors'
+            CONTROL_CENTER_KSQL_KSQLDB1_URL: "http://ksqldb-server:8088"
+            CONTROL_CENTER_KSQL_KSQLDB1_ADVERTISED_URL: "http://localhost:8088"
+            CONTROL_CENTER_SCHEMA_REGISTRY_URL: "http://schema-registry:8081"
+            CONTROL_CENTER_REPLICATION_FACTOR: 1
+            CONTROL_CENTER_INTERNAL_TOPICS_PARTITIONS: 1
+            CONTROL_CENTER_MONITORING_INTERCEPTOR_TOPIC_PARTITIONS: 1
+            CONFLUENT_METRICS_TOPIC_REPLICATION: 1
+            PORT: 9021
+        networks: [ mlnet ]
+
+    ksqldb-server:
+        image: confluentinc/cp-ksqldb-server:7.6.1
+        hostname: ksqldb-server
+        container_name: ksqldb-server
+        depends_on:
+            - broker
+            - connect
+        ports:
+            - "8088:8088"
+        environment:
+            KSQL_CONFIG_DIR: "/etc/ksql"
+            KSQL_BOOTSTRAP_SERVERS: "broker:29092"
+            KSQL_HOST_NAME: ksqldb-server
+            KSQL_LISTENERS: "http://0.0.0.0:8088"
+            KSQL_CACHE_MAX_BYTES_BUFFERING: 0
+            KSQL_KSQL_SCHEMA_REGISTRY_URL: "http://schema-registry:8081"
+            KSQL_PRODUCER_INTERCEPTOR_CLASSES: "io.confluent.monitoring.clients.interceptor.MonitoringProducerInterceptor"
+            KSQL_CONSUMER_INTERCEPTOR_CLASSES: "io.confluent.monitoring.clients.interceptor.MonitoringConsumerInterceptor"
+            KSQL_KSQL_CONNECT_URL: "http://connect:8083"
+            KSQL_KSQL_LOGGING_PROCESSING_TOPIC_REPLICATION_FACTOR: 1
+            KSQL_KSQL_LOGGING_PROCESSING_TOPIC_AUTO_CREATE: 'true'
+            KSQL_KSQL_LOGGING_PROCESSING_STREAM_AUTO_CREATE: 'true'
+        networks: [ mlnet ]
+
+volumes:
+    minio_data:
+
+networks:
+    mlnet:
+        driver: bridge
